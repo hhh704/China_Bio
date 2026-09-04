@@ -21,6 +21,9 @@ HK_CURRENCY_MAP = {
     "01801": ("CNY", "이노벤트 바이오 - 2025 연차보고서: 'Net profit... reached RMB813.6 million'"),
     "06160": ("USD", "비원메디슨(BeOne, 옛 베이진) - 2025 연결재무제표: 'product revenue of USD 5.28 billion'"),
     "00700": ("CNY", "텐센트 - 2025 실적발표: 'Revenues... to RMB751.8 billion' (교차검증 완료)"),
+    "03696": ("HKD", "인실리코 메디슨 - AKShare 원본 매출(2025, HKD 기준) 395,292,683 / 환율(~7.8) 환산 시 "
+                     "실제 공시 매출($56.24M USD, stockanalysis.com)과 일치. AKShare 원본이 HKD로 기록되어 "
+                     "있음을 실측으로 확인함(2026-09 검증)."),
     # 아래는 추정치이며 검증 필요 (신규 등록 시 확인 후 verified: True로 변경 권장)
     "00005": ("USD", "HSBC - 추정치, 검증 필요"),
 }
