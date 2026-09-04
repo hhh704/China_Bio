@@ -88,10 +88,10 @@ def get_financials(
             data.append({
                 "period": str(row.get("REPORT_DATE"))[:10],
                 "period_label": row.get("REPORT_DATE_NAME"),
-                "revenue": _safe_float(row.get("TOTAL_OPERATE_INCOME")),
-                "operating_income": _safe_float(row.get("OPERATE_PROFIT")),
+                "revenue": _to_millions(_safe_float(row.get("TOTAL_OPERATE_INCOME"))),
+                "operating_income": _to_millions(_safe_float(row.get("OPERATE_PROFIT"))),
                 "operating_income_is_gross_profit_fallback": False,
-                "net_income": _safe_float(row.get("PARENT_NETPROFIT")),
+                "net_income": _to_millions(_safe_float(row.get("PARENT_NETPROFIT"))),
             })
 
         return {
@@ -100,41 +100,78 @@ def get_financials(
             "currency": currency,
             "currency_confirmed": True,
             "frequency": freq,
+            "unit": "백만 (million)",
             "data": data,
         }
 
     else:  # HK
         code = normalize_hk_code(ticker)
-        indicator = "年度" if freq == "annual" else "报告期"
-        try:
-            df = ak.stock_financial_hk_report_em(stock=code, symbol="利润表", indicator=indicator)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"AKShare 조회 실패: {e}")
 
-        if df is None or df.empty:
-            raise HTTPException(status_code=404, detail="데이터가 없습니다")
+        if freq == "annual":
+            try:
+                df = ak.stock_financial_hk_report_em(stock=code, symbol="利润表", indicator="年度")
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"AKShare 조회 실패: {e}")
 
-        # 보고기간(REPORT_DATE) 단위로 그룹화 -> 각 기간별 필요한 항목만 추출
-        report_dates = df["REPORT_DATE"].unique()
-        report_dates = sorted(report_dates, reverse=True)[:limit]
+            if df is None or df.empty:
+                raise HTTPException(status_code=404, detail="데이터가 없습니다")
 
-        data = []
-        for rd in report_dates:
-            sub = df[df["REPORT_DATE"] == rd]
-            revenue = _extract_item(sub, "营业额")
-            operating_income = _extract_item(sub, "经营溢利")
-            gross_profit = _extract_item(sub, "毛利")
-            net_income = _extract_item(sub, "股东应占溢利")
+            report_dates = sorted(df["REPORT_DATE"].unique(), reverse=True)[:limit]
+            data = []
+            for rd in report_dates:
+                sub = df[df["REPORT_DATE"] == rd]
+                m = _extract_hk_metrics(sub)
+                data.append(_build_period_entry(str(rd)[:10], f"{str(rd)[:4]}년", m["revenue"], m["operating_income"],
+                                                 m["gross_profit"], m["net_income"]))
 
-            is_fallback = operating_income is None
-            data.append({
-                "period": str(rd)[:10],
-                "period_label": None,
-                "revenue": revenue,
-                "operating_income": operating_income if operating_income is not None else gross_profit,
-                "operating_income_is_gross_profit_fallback": is_fallback,
-                "net_income": net_income,
-            })
+        else:
+            # ⚠ 홍콩거래소는 분기 공시 의무가 없고 반기(H1)/연간(FY) 공시만 함.
+            # AKShare의 "报告期"는 H1(6/30, 상반기 누적)과 FY(12/31, 연간 누적) 값을
+            # 그대로 섞어서 주기 때문에, 하반기(H2) 실적을 보려면
+            # H2 = FY(연간 누적) - H1(상반기 누적) 로 직접 계산해야 함.
+            try:
+                df = ak.stock_financial_hk_report_em(stock=code, symbol="利润表", indicator="报告期")
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"AKShare 조회 실패: {e}")
+
+            if df is None or df.empty:
+                raise HTTPException(status_code=404, detail="데이터가 없습니다")
+
+            by_year = {}
+            for rd in df["REPORT_DATE"].unique():
+                rd_str = str(rd)[:10]
+                year, month_day = rd_str[:4], rd_str[5:10]
+                sub = df[df["REPORT_DATE"] == rd]
+                m = _extract_hk_metrics(sub)
+                by_year.setdefault(year, {})
+                if month_day == "06-30":
+                    by_year[year]["h1"] = m
+                elif month_day == "12-31":
+                    by_year[year]["fy"] = m
+
+            entries = []  # (정렬용 종료일, period_entry)
+            for year, parts in by_year.items():
+                h1, fy = parts.get("h1"), parts.get("fy")
+                if h1:
+                    entries.append((f"{year}-06-30", _build_period_entry(
+                        f"{year}-06-30", f"{year} 상반기",
+                        h1["revenue"], h1["operating_income"], h1["gross_profit"], h1["net_income"])))
+                if fy:
+                    if h1:
+                        h2_rev = _diff(fy["revenue"], h1["revenue"])
+                        h2_op = _diff(fy["operating_income"], h1["operating_income"])
+                        h2_gp = _diff(fy["gross_profit"], h1["gross_profit"])
+                        h2_net = _diff(fy["net_income"], h1["net_income"])
+                        entries.append((f"{year}-12-31", _build_period_entry(
+                            f"{year}-12-31", f"{year} 하반기", h2_rev, h2_op, h2_gp, h2_net)))
+                    else:
+                        # 상반기 데이터 없이 연간만 있는 예외 케이스 -> 연간 값을 그대로 표기(하반기 아님을 명시)
+                        entries.append((f"{year}-12-31", _build_period_entry(
+                            f"{year}-12-31", f"{year} 연간(상반기 데이터 없음)",
+                            fy["revenue"], fy["operating_income"], fy["gross_profit"], fy["net_income"])))
+
+            entries.sort(key=lambda x: x[0], reverse=True)
+            data = [e[1] for e in entries[:limit]]
 
         # 통화는 매핑 테이블 제안값 사용 (신뢰 가능한 필드가 API에 없으므로)
         suggestion = suggest_currency(ticker)
@@ -146,6 +183,7 @@ def get_financials(
             "currency_confirmed": not suggestion["needs_user_confirmation"],
             "currency_note": suggestion["source"],
             "frequency": freq,
+            "unit": "백만 (million)",
             "data": data,
         }
 
@@ -176,19 +214,21 @@ def get_valuation(ticker: str = Query(..., description="예: 600519.SH, 0700.HK"
 
     per = _last_value(per_df)
     pbr = _last_value(pbr_df)
-    market_cap = _last_value(cap_df)  # 단위: 억(100 million), Baidu 관례
+    market_cap_100m = _last_value(cap_df)  # Baidu 원본 단위: 억(100 million)
+    market_cap = round(market_cap_100m * 100, 2) if market_cap_100m is not None else None  # -> 백만 단위로 환산
 
     # PSR 계산을 위해 최근 연매출 조회 (통화 일치 여부 확인 필요)
+    # /financials가 이미 매출을 '백만' 단위로 반환하므로, 시가총액도 백만 단위로 맞추면
+    # 단순히 market_cap / revenue 로 바로 계산 가능 (억->원 환산 등 불필요)
     fin = get_financials(ticker=ticker, freq="annual", limit=1)
-    revenue = fin["data"][0]["revenue"] if fin["data"] else None
+    revenue = fin["data"][0]["revenue"] if fin["data"] else None  # 이미 백만 단위
     revenue_currency = fin["currency"]
 
     psr = None
     psr_note = None
     if market_cap is not None and revenue not in (None, 0):
         if revenue_currency == market_cap_currency:
-            # market_cap 단위(억) -> 원 단위로 환산 후 매출과 나눔
-            psr = round((market_cap * 1e8) / revenue, 2)
+            psr = round(market_cap / revenue, 2)
         else:
             psr_note = (
                 f"통화 불일치로 자동 계산 보류 "
@@ -201,7 +241,7 @@ def get_valuation(ticker: str = Query(..., description="예: 600519.SH, 0700.HK"
         "per_ttm": per,
         "pbr": pbr,
         "market_cap": market_cap,
-        "market_cap_unit": "억(100 million)",
+        "market_cap_unit": "백만 (million)",
         "market_cap_currency": market_cap_currency,
         "psr": psr,
         "psr_note": psr_note,
@@ -291,6 +331,43 @@ def _extract_item(df: pd.DataFrame, item_name: str):
     if row.empty:
         return None
     return _safe_float(row["AMOUNT"].iloc[0])
+
+
+def _extract_hk_metrics(sub: pd.DataFrame) -> dict:
+    """홍콩 손익계산서 한 보고기간(sub)에서 필요한 4개 항목을 원 단위(raw)로 추출"""
+    return {
+        "revenue": _extract_item(sub, "营业额"),
+        "operating_income": _extract_item(sub, "经营溢利"),
+        "gross_profit": _extract_item(sub, "毛利"),
+        "net_income": _extract_item(sub, "股东应占溢利"),
+    }
+
+
+def _diff(a, b):
+    """a-b. 둘 중 하나라도 없으면 None (섣불리 잘못된 값을 만들지 않기 위함)"""
+    if a is None or b is None:
+        return None
+    return a - b
+
+
+def _to_millions(v):
+    if v is None:
+        return None
+    return round(v / 1_000_000, 2)
+
+
+def _build_period_entry(period: str, period_label: str, revenue, operating_income, gross_profit, net_income) -> dict:
+    """반기/연간 raw 금액을 받아 백만 단위로 환산 + 영업이익 없으면 매출총이익 대체 표시하는 공통 로직"""
+    is_fallback = operating_income is None and gross_profit is not None
+    final_op = operating_income if operating_income is not None else gross_profit
+    return {
+        "period": period,
+        "period_label": period_label,
+        "revenue": _to_millions(revenue),
+        "operating_income": _to_millions(final_op),
+        "operating_income_is_gross_profit_fallback": is_fallback,
+        "net_income": _to_millions(net_income),
+    }
 
 
 def _last_value(df: pd.DataFrame):
