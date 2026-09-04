@@ -210,6 +210,51 @@ def get_valuation(ticker: str = Query(..., description="예: 600519.SH, 0700.HK"
 
 
 # ----------------------------------------------------------------------
+# 4) 개별 종목 뉴스
+# ----------------------------------------------------------------------
+@app.get("/news")
+def get_news(
+    ticker: str = Query(..., description="예: 600519.SH, 0700.HK"),
+    limit: int = Query(10, ge=1, le=50),
+):
+    """
+    동방재부(东方财富) 뉴스 검색 기반. 종목코드 키워드 검색 방식이라
+    관련성이 100% 정확하지 않을 수 있음(특히 홍콩 종목).
+    """
+    market = detect_market(ticker)
+    code = ticker.upper().replace(".SH", "").replace(".SZ", "").replace(".HK", "")
+
+    try:
+        df = ak.stock_news_em(symbol=code)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AKShare 뉴스 조회 실패: {e}")
+
+    if df is None or df.empty:
+        return {"ticker": ticker, "data": []}
+
+    df = df.head(limit)
+
+    # 컬럼명은 AKShare 버전에 따라 다를 수 있어 유연하게 매핑
+    col_title = next((c for c in df.columns if "标题" in c), None)
+    col_time = next((c for c in df.columns if "时间" in c or "日期" in c), None)
+    col_url = next((c for c in df.columns if "链接" in c or "网址" in c), None)
+    col_source = next((c for c in df.columns if "来源" in c), None)
+    col_content = next((c for c in df.columns if "内容" in c or "摘要" in c), None)
+
+    data = []
+    for _, row in df.iterrows():
+        data.append({
+            "title": row.get(col_title) if col_title else None,
+            "time": str(row.get(col_time)) if col_time else None,
+            "url": row.get(col_url) if col_url else None,
+            "source": row.get(col_source) if col_source else None,
+            "summary": row.get(col_content) if col_content else None,
+        })
+
+    return {"ticker": ticker, "data": data}
+
+
+# ----------------------------------------------------------------------
 # 유틸 함수
 # ----------------------------------------------------------------------
 def _safe_float(v):
@@ -241,5 +286,6 @@ def root():
         "status": "ok",
         "endpoints": ["/financials?ticker=600519.SH&freq=annual",
                       "/valuation?ticker=0700.HK",
-                      "/currency-suggestion?ticker=1801.HK"],
+                      "/currency-suggestion?ticker=1801.HK",
+                      "/news?ticker=0700.HK"],
     }
