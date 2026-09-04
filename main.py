@@ -218,19 +218,21 @@ def get_news(
     limit: int = Query(10, ge=1, le=50),
 ):
     """
-    동방재부(东方财富) 뉴스 검색 기반. 종목코드 키워드 검색 방식이라
-    관련성이 100% 정확하지 않을 수 있음(특히 홍콩 종목).
+    동방재부(东方财富) 뉴스 검색 기반.
+    종목코드로 검색하면 무관한 결과가 많이 섞여서(예: 다른 종목의 코드가 우연히
+    일치), 먼저 회사의 실제 중국어 이름을 조회한 뒤 그 이름으로 검색합니다.
     """
     market = detect_market(ticker)
-    code = ticker.upper().replace(".SH", "").replace(".SZ", "").replace(".HK", "")
+    company_name = _get_company_name(ticker, market)
+    search_keyword = company_name or ticker.upper().replace(".SH", "").replace(".SZ", "").replace(".HK", "")
 
     try:
-        df = ak.stock_news_em(symbol=code)
+        df = ak.stock_news_em(symbol=search_keyword)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AKShare 뉴스 조회 실패: {e}")
 
     if df is None or df.empty:
-        return {"ticker": ticker, "data": []}
+        return {"ticker": ticker, "company_name": company_name, "data": []}
 
     df = df.head(limit)
 
@@ -251,7 +253,24 @@ def get_news(
             "summary": row.get(col_content) if col_content else None,
         })
 
-    return {"ticker": ticker, "data": data}
+    return {"ticker": ticker, "company_name": company_name, "data": data}
+
+
+def _get_company_name(ticker: str, market: str):
+    """이미 재무제표 조회에 쓰는 함수의 SECURITY_NAME_ABBR 필드를 재사용해
+    회사의 실제 중국어 이름을 가져옴 (뉴스 검색 정확도를 위해 필요)."""
+    try:
+        if market in ("A_SH", "A_SZ"):
+            symbol = a_share_em_symbol(ticker)
+            df = ak.stock_profit_sheet_by_yearly_em(symbol=symbol)
+        else:
+            code = normalize_hk_code(ticker)
+            df = ak.stock_financial_hk_report_em(stock=code, symbol="利润表", indicator="年度")
+        if df is not None and not df.empty and "SECURITY_NAME_ABBR" in df.columns:
+            return df["SECURITY_NAME_ABBR"].iloc[0]
+    except Exception:
+        pass
+    return None
 
 
 # ----------------------------------------------------------------------
