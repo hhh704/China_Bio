@@ -255,25 +255,24 @@ def get_valuation(ticker: str = Query(..., description="예: 600519.SH, 0700.HK"
 @app.get("/quote")
 def get_quote(ticker: str = Query(..., description="예: 600519.SH, 0700.HK")):
     """
-    ⚠ stock_hk_spot_em()/stock_zh_a_spot_em()은 전체 시장(수천 종목)을 한 번에
-    받아오는 방식이라 응답이 크고 불안정해서 연결이 끊기는 문제가 있었음
-    (실제 운영 서버에서 확인됨). 대신 이미 안정적으로 작동하는 개별 종목
-    히스토리 함수(stock_hk_hist/stock_zh_a_hist)를 최근 며칠만 조회해서
-    가장 최근 종가를 '현재가'로, 그 전날 종가와 비교해 등락률을 계산함.
+    ⚠ 홍콩(stock_hk_hist, 동방재부)에서 연결 끊김 문제가 반복 확인되어,
+    홍콩만 신랑재경(新浪财经, Sina) 기반 stock_hk_daily()로 전환함.
+    A주는 신랑재경 쪽 함수(stock_zh_a_daily 등)에 "반복 호출 시 IP 일시
+    차단됨" 공식 경고가 있어 그대로 동방재부(stock_zh_a_hist)를 유지함.
     시가총액은 /valuation에서 이미 제공하므로 여기서는 반환하지 않음.
     """
     from datetime import datetime, timedelta
 
     market = detect_market(ticker)
-    end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")  # 주말/공휴일 감안해 넉넉히
 
     try:
         if market == "HK":
             code = normalize_hk_code(ticker)
-            df = ak.stock_hk_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="")
+            df = ak.stock_hk_daily(symbol=code, adjust="")
         else:
             code = ticker.upper().replace(".SH", "").replace(".SZ", "")
+            end_date = datetime.now().strftime("%Y%m%d")
+            start_date = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
             df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AKShare 시세 조회 실패: {e}")
@@ -281,9 +280,14 @@ def get_quote(ticker: str = Query(..., description="예: 600519.SH, 0700.HK")):
     if df is None or df.empty:
         raise HTTPException(status_code=404, detail=f"'{code}' 종목의 최근 시세를 찾지 못했습니다")
 
-    col_close = next((c for c in df.columns if c == "收盘" or "收盘" in c), None)
+    # stock_hk_daily(Sina)는 영문 컬럼(close 등), stock_zh_a_hist(동방재부)는 중문 컬럼(收盘) 사용
+    # -> 둘 다 지원하도록 유연하게 매칭
+    col_close = next((c for c in df.columns if c in ("close", "收盘") or "收盘" in str(c)), None)
     if col_close is None:
         raise HTTPException(status_code=502, detail=f"종가 컬럼을 찾지 못함. 실제 컬럼: {list(df.columns)}")
+
+    if market == "HK":
+        df = df.tail(10)  # stock_hk_daily는 전체 상장이후 데이터를 다 주므로 최근 구간만 사용
 
     closes = df[col_close].apply(_safe_float).tolist()
     price = closes[-1] if closes else None
@@ -362,8 +366,9 @@ def get_history(
 
     try:
         if market == "HK":
+            # ⚠ 동방재부(stock_hk_hist)에서 연결 끊김 문제 확인되어 신랑재경(Sina) 기반으로 전환
             code = normalize_hk_code(ticker)
-            df = ak.stock_hk_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="")
+            df = ak.stock_hk_daily(symbol=code, adjust="")
         else:
             code = ticker.upper().replace(".SH", "").replace(".SZ", "")
             df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="")
@@ -373,10 +378,14 @@ def get_history(
     if df is None or df.empty:
         return {"ticker": ticker, "data": []}
 
-    col_date = next((c for c in df.columns if "日期" in c), None)
-    col_close = next((c for c in df.columns if c == "收盘" or "收盘" in c), None)
+    # stock_hk_daily(Sina)는 영문 컬럼(date/close), stock_zh_a_hist(동방재부)는 중문 컬럼(日期/收盘)
+    col_date = next((c for c in df.columns if c in ("date", "日期") or "日期" in str(c)), None)
+    col_close = next((c for c in df.columns if c in ("close", "收盘") or "收盘" in str(c)), None)
     if col_date is None or col_close is None:
         raise HTTPException(status_code=502, detail=f"필요 컬럼을 찾지 못함. 실제 컬럼: {list(df.columns)}")
+
+    if market == "HK":
+        df = df.tail(days)  # stock_hk_daily는 상장 이후 전체 데이터를 다 주므로 요청한 기간만큼만 자르기
 
     data = [
         {"date": str(row[col_date])[:10], "close": _safe_float(row[col_close])}
