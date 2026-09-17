@@ -250,14 +250,58 @@ def get_valuation(ticker: str = Query(..., description="예: 600519.SH, 0700.HK"
 
 
 # ----------------------------------------------------------------------
-# 4) 현재 시세 (주가·시가총액·등락률) — iTick 대체용
+# 4) 현재 시세 (주가·등락률) — iTick 대체용
 # ----------------------------------------------------------------------
 @app.get("/quote")
 def get_quote(ticker: str = Query(..., description="예: 600519.SH, 0700.HK")):
     """
-    동방재부(东方财富) 전종목 스팟시세 스냅샷에서 해당 종목만 필터링.
-    ⚠ 전체 시장을 한 번에 받아오는 방식이라 개별 종목 API보다 응답이 약간
-    느릴 수 있으나, 별도 계정·API 키·만료 문제 없이 완전 무료로 지속 사용 가능.
+    ⚠ stock_hk_spot_em()/stock_zh_a_spot_em()은 전체 시장(수천 종목)을 한 번에
+    받아오는 방식이라 응답이 크고 불안정해서 연결이 끊기는 문제가 있었음
+    (실제 운영 서버에서 확인됨). 대신 이미 안정적으로 작동하는 개별 종목
+    히스토리 함수(stock_hk_hist/stock_zh_a_hist)를 최근 며칠만 조회해서
+    가장 최근 종가를 '현재가'로, 그 전날 종가와 비교해 등락률을 계산함.
+    시가총액은 /valuation에서 이미 제공하므로 여기서는 반환하지 않음.
+    """
+    from datetime import datetime, timedelta
+
+    market = detect_market(ticker)
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")  # 주말/공휴일 감안해 넉넉히
+
+    try:
+        if market == "HK":
+            code = normalize_hk_code(ticker)
+            df = ak.stock_hk_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="")
+        else:
+            code = ticker.upper().replace(".SH", "").replace(".SZ", "")
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AKShare 시세 조회 실패: {e}")
+
+    if df is None or df.empty:
+        raise HTTPException(status_code=404, detail=f"'{code}' 종목의 최근 시세를 찾지 못했습니다")
+
+    col_close = next((c for c in df.columns if c == "收盘" or "收盘" in c), None)
+    if col_close is None:
+        raise HTTPException(status_code=502, detail=f"종가 컬럼을 찾지 못함. 실제 컬럼: {list(df.columns)}")
+
+    closes = df[col_close].apply(_safe_float).tolist()
+    price = closes[-1] if closes else None
+    prev = closes[-2] if len(closes) >= 2 else None
+    change_pct = round((price - prev) / prev * 100, 2) if (price is not None and prev not in (None, 0)) else None
+
+    return {
+        "ticker": ticker,
+        "price": price,
+        "change_pct": change_pct,
+    }
+
+
+@app.get("/quote_legacy_spot_debug")
+def get_quote_legacy_spot_debug(ticker: str = Query(...)):
+    """
+    참고용(디버그): 전체시장 스냅샷 방식 원본. /quote가 또 문제 생기면
+    이 엔드포인트로 실제 에러/컬럼을 다시 확인하기 위해 남겨둠.
     """
     market = detect_market(ticker)
 
@@ -290,6 +334,7 @@ def get_quote(ticker: str = Query(..., description="예: 600519.SH, 0700.HK")):
     market_cap = _to_millions(market_cap_raw) if market_cap_raw is not None else None
 
     return {
+
         "ticker": ticker,
         "price": price,
         "change_pct": change_pct,
