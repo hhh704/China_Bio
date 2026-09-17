@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import akshare as ak
 import pandas as pd
+import requests
 
 from currency_mapping import suggest_currency, normalize_hk_code, A_SHARE_DEFAULT_CURRENCY
 
@@ -255,143 +256,88 @@ def get_valuation(ticker: str = Query(..., description="예: 600519.SH, 0700.HK"
 @app.get("/quote")
 def get_quote(ticker: str = Query(..., description="예: 600519.SH, 0700.HK")):
     """
-    ⚠ 홍콩(stock_hk_hist, 동방재부)에서 연결 끊김 문제가 반복 확인되어,
-    홍콩만 신랑재경(新浪财经, Sina) 기반 stock_hk_daily()로 전환함.
-    A주는 신랑재경 쪽 함수(stock_zh_a_daily 등)에 "반복 호출 시 IP 일시
-    차단됨" 공식 경고가 있어 그대로 동방재부(stock_zh_a_hist)를 유지함.
-    시가총액은 /valuation에서 이미 제공하므로 여기서는 반환하지 않음.
+    ⚠ AKShare(동방재부/신랑재경)의 '시세' 계열 함수는 Render 서버 IP에서만
+    유독 연결이 끊기는 문제가 실측으로 확인됨(로컬 PC에서는 정상 작동).
+    중국 금융사이트들이 클라우드 데이터센터 IP를, 특히 실시간 시세
+    엔드포인트에서 우선적으로 차단하는 것으로 추정됨.
+    브라우저에서 야후 파이낸스를 직접 호출하는 것도 CORS로 막혀서 실패함
+    (실측 확인). 그래서 '서버(우리 쪽)가 야후를 대신 호출'하는 방식을 씀 —
+    서버-서버 호출은 CORS 자체가 적용되지 않고, 야후는 중국 사이트와 달리
+    클라우드 IP를 시세 엔드포인트에서 차단하지 않는 것으로 보임.
     """
-    from datetime import datetime, timedelta
-
-    market = detect_market(ticker)
-
+    symbol = _yahoo_symbol(ticker)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     try:
-        if market == "HK":
-            code = normalize_hk_code(ticker)
-            df = ak.stock_hk_daily(symbol=code, adjust="")
-        else:
-            code = ticker.upper().replace(".SH", "").replace(".SZ", "")
-            end_date = datetime.now().strftime("%Y%m%d")
-            start_date = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="")
+        resp = requests.get(
+            url, params={"range": "5d", "interval": "1d"},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+        )
+        data = resp.json()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"AKShare 시세 조회 실패: {e}")
+        raise HTTPException(status_code=502, detail=f"Yahoo Finance 조회 실패: {e}")
 
-    if df is None or df.empty:
-        raise HTTPException(status_code=404, detail=f"'{code}' 종목의 최근 시세를 찾지 못했습니다")
+    result = (data.get("chart") or {}).get("result")
+    if not result:
+        raise HTTPException(status_code=404, detail=f"'{ticker}' 시세를 찾지 못했습니다: {data}")
 
-    # stock_hk_daily(Sina)는 영문 컬럼(close 등), stock_zh_a_hist(동방재부)는 중문 컬럼(收盘) 사용
-    # -> 둘 다 지원하도록 유연하게 매칭
-    col_close = next((c for c in df.columns if c in ("close", "收盘") or "收盘" in str(c)), None)
-    if col_close is None:
-        raise HTTPException(status_code=502, detail=f"종가 컬럼을 찾지 못함. 실제 컬럼: {list(df.columns)}")
+    meta = result[0].get("meta", {})
+    price = meta.get("regularMarketPrice")
+    prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+    change_pct = (
+        round((price - prev_close) / prev_close * 100, 2)
+        if (price is not None and prev_close) else None
+    )
 
-    if market == "HK":
-        df = df.tail(10)  # stock_hk_daily는 전체 상장이후 데이터를 다 주므로 최근 구간만 사용
-
-    closes = df[col_close].apply(_safe_float).tolist()
-    price = closes[-1] if closes else None
-    prev = closes[-2] if len(closes) >= 2 else None
-    change_pct = round((price - prev) / prev * 100, 2) if (price is not None and prev not in (None, 0)) else None
-
-    return {
-        "ticker": ticker,
-        "price": price,
-        "change_pct": change_pct,
-    }
+    return {"ticker": ticker, "price": price, "change_pct": change_pct}
 
 
-@app.get("/quote_legacy_spot_debug")
-def get_quote_legacy_spot_debug(ticker: str = Query(...)):
-    """
-    참고용(디버그): 전체시장 스냅샷 방식 원본. /quote가 또 문제 생기면
-    이 엔드포인트로 실제 에러/컬럼을 다시 확인하기 위해 남겨둠.
-    """
-    market = detect_market(ticker)
-
-    try:
-        if market == "HK":
-            df = ak.stock_hk_spot_em()
-            code = normalize_hk_code(ticker)
-        else:
-            df = ak.stock_zh_a_spot_em()
-            code = ticker.upper().replace(".SH", "").replace(".SZ", "")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"AKShare 시세 조회 실패: {e}")
-
-    col_code = next((c for c in df.columns if c == "代码" or "代码" in c), None)
-    if col_code is None:
-        raise HTTPException(status_code=502, detail=f"종목코드 컬럼을 찾지 못함. 실제 컬럼: {list(df.columns)}")
-
-    row = df[df[col_code].astype(str).str.strip() == code]
-    if row.empty:
-        raise HTTPException(status_code=404, detail=f"'{code}' 종목을 시세 스냅샷에서 찾지 못했습니다")
-    row = row.iloc[0]
-
-    col_price = next((c for c in df.columns if "最新价" in c), None)
-    col_change_pct = next((c for c in df.columns if "涨跌幅" in c), None)
-    col_market_cap = next((c for c in df.columns if "总市值" in c), None)
-
-    price = _safe_float(row.get(col_price)) if col_price else None
-    change_pct = _safe_float(row.get(col_change_pct)) if col_change_pct else None
-    market_cap_raw = _safe_float(row.get(col_market_cap)) if col_market_cap else None
-    market_cap = _to_millions(market_cap_raw) if market_cap_raw is not None else None
-
-    return {
-
-        "ticker": ticker,
-        "price": price,
-        "change_pct": change_pct,
-        "market_cap": market_cap,
-        "market_cap_unit": "백만 (million)" if market_cap is not None else None,
-        "market_cap_currency": "HKD" if market == "HK" else A_SHARE_DEFAULT_CURRENCY,
-        # 진단용 - 실제 컬럼명이 다를 경우 확인하기 위함. 안정화되면 제거 가능.
-        "_debug_columns": list(df.columns)[:15],
-    }
+def _yahoo_symbol(ticker: str) -> str:
+    """상해(.SH)는 야후 표기(.SS)로 변환, 홍콩(.HK)·선전(.SZ)은 그대로 사용"""
+    if ticker.upper().endswith(".SH"):
+        return ticker[:-3] + ".SS"
+    return ticker
 
 
 # ----------------------------------------------------------------------
-# 5) 1년치 일별 시세 히스토리 — iTick kline 대체용
+# 5) 1년치 일별 시세 히스토리 (야후 파이낸스, 서버사이드 호출)
 # ----------------------------------------------------------------------
 @app.get("/history")
 def get_history(
     ticker: str = Query(..., description="예: 600519.SH, 0700.HK"),
     days: int = Query(365, ge=30, le=1500),
 ):
-    from datetime import datetime, timedelta
+    from datetime import datetime, timezone
 
-    market = detect_market(ticker)
-    end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-
+    symbol = _yahoo_symbol(ticker)
+    range_param = "1y" if days <= 365 else ("2y" if days <= 730 else "5y")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     try:
-        if market == "HK":
-            # ⚠ 동방재부(stock_hk_hist)에서 연결 끊김 문제 확인되어 신랑재경(Sina) 기반으로 전환
-            code = normalize_hk_code(ticker)
-            df = ak.stock_hk_daily(symbol=code, adjust="")
-        else:
-            code = ticker.upper().replace(".SH", "").replace(".SZ", "")
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="")
+        resp = requests.get(
+            url, params={"range": range_param, "interval": "1d"},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+        )
+        data = resp.json()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"AKShare 히스토리 조회 실패: {e}")
+        raise HTTPException(status_code=502, detail=f"Yahoo Finance 히스토리 조회 실패: {e}")
 
-    if df is None or df.empty:
+    result = (data.get("chart") or {}).get("result")
+    if not result:
         return {"ticker": ticker, "data": []}
 
-    # stock_hk_daily(Sina)는 영문 컬럼(date/close), stock_zh_a_hist(동방재부)는 중문 컬럼(日期/收盘)
-    col_date = next((c for c in df.columns if c in ("date", "日期") or "日期" in str(c)), None)
-    col_close = next((c for c in df.columns if c in ("close", "收盘") or "收盘" in str(c)), None)
-    if col_date is None or col_close is None:
-        raise HTTPException(status_code=502, detail=f"필요 컬럼을 찾지 못함. 실제 컬럼: {list(df.columns)}")
+    r0 = result[0]
+    timestamps = r0.get("timestamp") or []
+    closes = ((r0.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
 
-    if market == "HK":
-        df = df.tail(days)  # stock_hk_daily는 상장 이후 전체 데이터를 다 주므로 요청한 기간만큼만 자르기
+    out = []
+    for t, c in zip(timestamps, closes):
+        if c is None:
+            continue
+        date_str = datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d")
+        out.append({"date": date_str, "close": round(c, 4)})
 
-    data = [
-        {"date": str(row[col_date])[:10], "close": _safe_float(row[col_close])}
-        for _, row in df.iterrows()
-    ]
-    return {"ticker": ticker, "data": data}
+    return {"ticker": ticker, "data": out[-days:]}
+
+
 
 
 # ----------------------------------------------------------------------
