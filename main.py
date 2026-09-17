@@ -213,9 +213,9 @@ def get_valuation(ticker: str = Query(..., description="예: 600519.SH, 0700.HK"
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AKShare 조회 실패: {e}")
 
-    per = _last_value(per_df)
-    pbr = _last_value(pbr_df)
-    market_cap_100m = _last_value(cap_df)  # Baidu 원본 단위: 억(100 million)
+    per, per_as_of = _last_value_with_date(per_df)
+    pbr, pbr_as_of = _last_value_with_date(pbr_df)
+    market_cap_100m, market_cap_as_of = _last_value_with_date(cap_df)  # Baidu 원본 단위: 억(100 million)
     market_cap = round(market_cap_100m * 100, 2) if market_cap_100m is not None else None  # -> 백만 단위로 환산
 
     # PSR 계산을 위해 최근 연매출 조회 (통화 일치 여부 확인 필요)
@@ -240,8 +240,11 @@ def get_valuation(ticker: str = Query(..., description="예: 600519.SH, 0700.HK"
     return {
         "ticker": ticker,
         "per_ttm": per,
+        "per_as_of": per_as_of,
         "pbr": pbr,
+        "pbr_as_of": pbr_as_of,
         "market_cap": market_cap,
+        "market_cap_as_of": market_cap_as_of,
         "market_cap_unit": "백만 (million)",
         "market_cap_currency": market_cap_currency,
         "psr": psr,
@@ -461,10 +464,14 @@ def _build_period_entry(period: str, period_label: str, revenue, operating_incom
     }
 
 
-def _last_value(df: pd.DataFrame):
+def _last_value_with_date(df: pd.DataFrame):
+    """Baidu 밸류에이션 시계열({date, value})에서 마지막(최신) 값과 그 날짜를 함께 반환"""
     if df is None or df.empty:
-        return None
-    return _safe_float(df["value"].iloc[-1])
+        return None, None
+    last_row = df.iloc[-1]
+    value = _safe_float(last_row.get("value"))
+    date = str(last_row.get("date")) if "date" in df.columns else None
+    return value, date
 
 
 @app.get("/")
