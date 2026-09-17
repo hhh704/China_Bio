@@ -250,6 +250,97 @@ def get_valuation(ticker: str = Query(..., description="예: 600519.SH, 0700.HK"
 
 
 # ----------------------------------------------------------------------
+# 4) 현재 시세 (주가·시가총액·등락률) — iTick 대체용
+# ----------------------------------------------------------------------
+@app.get("/quote")
+def get_quote(ticker: str = Query(..., description="예: 600519.SH, 0700.HK")):
+    """
+    동방재부(东方财富) 전종목 스팟시세 스냅샷에서 해당 종목만 필터링.
+    ⚠ 전체 시장을 한 번에 받아오는 방식이라 개별 종목 API보다 응답이 약간
+    느릴 수 있으나, 별도 계정·API 키·만료 문제 없이 완전 무료로 지속 사용 가능.
+    """
+    market = detect_market(ticker)
+
+    try:
+        if market == "HK":
+            df = ak.stock_hk_spot_em()
+            code = normalize_hk_code(ticker)
+        else:
+            df = ak.stock_zh_a_spot_em()
+            code = ticker.upper().replace(".SH", "").replace(".SZ", "")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AKShare 시세 조회 실패: {e}")
+
+    col_code = next((c for c in df.columns if c == "代码" or "代码" in c), None)
+    if col_code is None:
+        raise HTTPException(status_code=502, detail=f"종목코드 컬럼을 찾지 못함. 실제 컬럼: {list(df.columns)}")
+
+    row = df[df[col_code].astype(str).str.strip() == code]
+    if row.empty:
+        raise HTTPException(status_code=404, detail=f"'{code}' 종목을 시세 스냅샷에서 찾지 못했습니다")
+    row = row.iloc[0]
+
+    col_price = next((c for c in df.columns if "最新价" in c), None)
+    col_change_pct = next((c for c in df.columns if "涨跌幅" in c), None)
+    col_market_cap = next((c for c in df.columns if "总市值" in c), None)
+
+    price = _safe_float(row.get(col_price)) if col_price else None
+    change_pct = _safe_float(row.get(col_change_pct)) if col_change_pct else None
+    market_cap_raw = _safe_float(row.get(col_market_cap)) if col_market_cap else None
+    market_cap = _to_millions(market_cap_raw) if market_cap_raw is not None else None
+
+    return {
+        "ticker": ticker,
+        "price": price,
+        "change_pct": change_pct,
+        "market_cap": market_cap,
+        "market_cap_unit": "백만 (million)" if market_cap is not None else None,
+        "market_cap_currency": "HKD" if market == "HK" else A_SHARE_DEFAULT_CURRENCY,
+        # 진단용 - 실제 컬럼명이 다를 경우 확인하기 위함. 안정화되면 제거 가능.
+        "_debug_columns": list(df.columns)[:15],
+    }
+
+
+# ----------------------------------------------------------------------
+# 5) 1년치 일별 시세 히스토리 — iTick kline 대체용
+# ----------------------------------------------------------------------
+@app.get("/history")
+def get_history(
+    ticker: str = Query(..., description="예: 600519.SH, 0700.HK"),
+    days: int = Query(365, ge=30, le=1500),
+):
+    from datetime import datetime, timedelta
+
+    market = detect_market(ticker)
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+
+    try:
+        if market == "HK":
+            code = normalize_hk_code(ticker)
+            df = ak.stock_hk_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="")
+        else:
+            code = ticker.upper().replace(".SH", "").replace(".SZ", "")
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AKShare 히스토리 조회 실패: {e}")
+
+    if df is None or df.empty:
+        return {"ticker": ticker, "data": []}
+
+    col_date = next((c for c in df.columns if "日期" in c), None)
+    col_close = next((c for c in df.columns if c == "收盘" or "收盘" in c), None)
+    if col_date is None or col_close is None:
+        raise HTTPException(status_code=502, detail=f"필요 컬럼을 찾지 못함. 실제 컬럼: {list(df.columns)}")
+
+    data = [
+        {"date": str(row[col_date])[:10], "close": _safe_float(row[col_close])}
+        for _, row in df.iterrows()
+    ]
+    return {"ticker": ticker, "data": data}
+
+
+# ----------------------------------------------------------------------
 # 4) 개별 종목 뉴스
 # ----------------------------------------------------------------------
 @app.get("/news")
@@ -383,5 +474,7 @@ def root():
         "endpoints": ["/financials?ticker=600519.SH&freq=annual",
                       "/valuation?ticker=0700.HK",
                       "/currency-suggestion?ticker=1801.HK",
-                      "/news?ticker=0700.HK"],
+                      "/news?ticker=0700.HK",
+                      "/quote?ticker=0700.HK",
+                      "/history?ticker=0700.HK&days=365"],
     }
